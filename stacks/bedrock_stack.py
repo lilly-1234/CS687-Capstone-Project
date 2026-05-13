@@ -12,12 +12,16 @@ from aws_cdk import (
 )
 from constructs import Construct
 
-
+# Create the main stack class
 class BedrockAgentStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
+        
+        # Initialize parent stack
         super().__init__(scope, construct_id, **kwargs)
 
-        # ── 1. Bedrock Guardrail ──────────────────────────────────────────────
+        # 1. CREATE BEDROCK GUARDRAIL
+
+        # Guardrail protects the LLM from harmful inputs/outputs
         guardrail = bedrock.CfnGuardrail(
             self,
             "AgentGuardrail",
@@ -26,31 +30,58 @@ class BedrockAgentStack(Stack):
 
             # Harmful / toxic content policy
             content_policy_config=bedrock.CfnGuardrail.ContentPolicyConfigProperty(
+                
+                # Filters for harmful content
                 filters_config=[
+
+                    # Hate speech filter
                     bedrock.CfnGuardrail.ContentFilterConfigProperty(
-                        type="HATE",         input_strength="HIGH",   output_strength="HIGH"
+                        type="HATE",         
+                        input_strength="HIGH",   
+                        output_strength="HIGH"
                     ),
+
+                    # Insults filter
                     bedrock.CfnGuardrail.ContentFilterConfigProperty(
-                        type="INSULTS",      input_strength="HIGH",   output_strength="HIGH"
+                        type="INSULTS",      
+                        input_strength="HIGH",   
+                        output_strength="HIGH"
                     ),
+                    
+                    # Sexual content filter
                     bedrock.CfnGuardrail.ContentFilterConfigProperty(
-                        type="SEXUAL",       input_strength="HIGH",   output_strength="HIGH"
+                        type="SEXUAL",       
+                        input_strength="HIGH",   
+                        output_strength="HIGH"
                     ),
+
+                    # Violence filter
                     bedrock.CfnGuardrail.ContentFilterConfigProperty(
-                        type="VIOLENCE",     input_strength="HIGH",   output_strength="HIGH"
+                        type="VIOLENCE",     
+                        input_strength="HIGH",   
+                        output_strength="HIGH"
                     ),
+
+                    # Misconduct filter
                     bedrock.CfnGuardrail.ContentFilterConfigProperty(
-                        type="MISCONDUCT",   input_strength="HIGH",   output_strength="HIGH"
+                        type="MISCONDUCT",   
+                        input_strength="HIGH",   
+                        output_strength="HIGH"
                     ),
+                    
+                    # Prompt injection protection
                     bedrock.CfnGuardrail.ContentFilterConfigProperty(
                         type="PROMPT_ATTACK", input_strength="HIGH",  output_strength="NONE"
                     ),
                 ]
             ),
 
-            # Off-topic policy — add/edit topics to match your use case
+            # Off-topic policy
+            # Blocks restricted topic
             topic_policy_config=bedrock.CfnGuardrail.TopicPolicyConfigProperty(
                 topics_config=[
+
+                     # Block competitor comparisons
                     bedrock.CfnGuardrail.TopicConfigProperty(
                         name="competitor-discussion",
                         definition="Any discussion, comparison, or mention of competitor products.",
@@ -60,6 +91,8 @@ class BedrockAgentStack(Stack):
                         ],
                         type="DENY",
                     ),
+
+                    # Block financial advice
                     bedrock.CfnGuardrail.TopicConfigProperty(
                         name="financial-advice",
                         definition="Requests for personalised financial or investment advice.",
@@ -77,27 +110,36 @@ class BedrockAgentStack(Stack):
                 managed_word_lists_config=[
                     bedrock.CfnGuardrail.ManagedWordsConfigProperty(type="PROFANITY")
                 ],
+
+                # Custom blocked words
                 words_config=[
                     bedrock.CfnGuardrail.WordConfigProperty(text="jailbreak"),
                     bedrock.CfnGuardrail.WordConfigProperty(text="ignore previous instructions"),
                     bedrock.CfnGuardrail.WordConfigProperty(text="internal-secret"),
-                    # ← Add your own terms here
                 ],
             ),
 
             # PII detection and redaction
             sensitive_information_policy_config=bedrock.CfnGuardrail.SensitiveInformationPolicyConfigProperty(
+               
+                # PII detection rules
                 pii_entities_config=[
+
+                    # Hide emails, phone numbers, block SSN, card numbers
                     bedrock.CfnGuardrail.PiiEntityConfigProperty(type="EMAIL",   action="ANONYMIZE"),
                     bedrock.CfnGuardrail.PiiEntityConfigProperty(type="PHONE",   action="ANONYMIZE"),
                     bedrock.CfnGuardrail.PiiEntityConfigProperty(type="US_SOCIAL_SECURITY_NUMBER", action="BLOCK"),
                     bedrock.CfnGuardrail.PiiEntityConfigProperty(
                         type="CREDIT_DEBIT_CARD_NUMBER", action="BLOCK"
                     ),
+
+                    # Block AWS keys, AWS secret keys, passwords
                     bedrock.CfnGuardrail.PiiEntityConfigProperty(type="AWS_ACCESS_KEY", action="BLOCK"),
                     bedrock.CfnGuardrail.PiiEntityConfigProperty(type="AWS_SECRET_KEY", action="BLOCK"),
                     bedrock.CfnGuardrail.PiiEntityConfigProperty(type="PASSWORD",        action="BLOCK"),
                 ],
+                
+                # Custom regex pattern
                 regexes_config=[
                     bedrock.CfnGuardrail.RegexConfigProperty(
                         name="employee-id",
@@ -113,23 +155,33 @@ class BedrockAgentStack(Stack):
                 "Please rephrase and try again."
             ),
             blocked_outputs_messaging=(
-                "I'm sorry, I can't provide a response to that request."
+                "I'm sorry, I can't provide a response."
             ),
         )
+        
+        # 2. CREATE GUARDRAIL VERSION
 
-        # Publish guardrail version (use "DRAFT" during dev, version in prod)
+        # Publish guardrail version
         guardrail_version = bedrock.CfnGuardrailVersion(
             self,
             "AgentGuardrailVersion",
+
+            # Link to guardrail
             guardrail_identifier=guardrail.attr_guardrail_id,
             description="Initial production version",
         )
-
-        # ── 2. Lambda execution role ──────────────────────────────────────────
+        
+        # 3. CREATE IAM ROLE FOR LAMBDA
+        
+        # Lambda execution role
         lambda_role = iam.Role(
             self,
             "LambdaExecutionRole",
+
+            # Lambda service can assume this role
             assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+
+            # Basic logging permissions
             managed_policies=[
                 iam.ManagedPolicy.from_aws_managed_policy_name(
                     "service-role/AWSLambdaBasicExecutionRole"  # CloudWatch logs
@@ -137,11 +189,15 @@ class BedrockAgentStack(Stack):
             ],
         )
 
-        # Bedrock permissions — scoped to Claude Sonnet 4.5 inference profile
+        # Allow Lambda to invoke Bedrock model
         lambda_role.add_to_policy(
             iam.PolicyStatement(
                 effect=iam.Effect.ALLOW,
+                
+                # Allowed Bedrock actions
                 actions=["bedrock:InvokeModel", "bedrock:GetInferenceProfile"],
+                
+                # Claude model ARNs
                 resources=[
                     f"arn:aws:bedrock:{self.region}::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0",
                     f"arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0",
@@ -152,7 +208,8 @@ class BedrockAgentStack(Stack):
                 ],
             )
         )
-
+        
+        # Allow Lambda to apply guardrai
         lambda_role.add_to_policy(
             iam.PolicyStatement(
                 effect=iam.Effect.ALLOW,
@@ -161,14 +218,19 @@ class BedrockAgentStack(Stack):
             )
         )
 
-        # ── 3. Lambda function ────────────────────────────────────────────────
+        # 4. CREATE CLOUDWATCH LOG GROUP
         log_group = logs.LogGroup(
             self,
             "LambdaLogGroup",
+
+            # Keep logs for one week
             retention=logs.RetentionDays.ONE_WEEK,
+
+            # Delete logs when stack is removed
             removal_policy=cdk.RemovalPolicy.DESTROY,
         )
-
+        
+        # 5. CREATE LAMBDA FUNCTION
         fn = lambda_.Function(
             self,
             "BedrockAgentFunction",
@@ -187,37 +249,44 @@ class BedrockAgentStack(Stack):
             },
         )
 
-        # ── 4. API Gateway HTTP API ───────────────────────────────────────────
+        # 6. CREATE API GATEWAY
+
+        # API log group
         access_log_group = logs.LogGroup(
             self,
             "ApiAccessLogGroup",
             retention=logs.RetentionDays.ONE_WEEK,
             removal_policy=cdk.RemovalPolicy.DESTROY,
         )
-
+        
+        # Create HTTP API
         http_api = apigwv2.HttpApi(
             self,
             "BedrockHttpApi",
             api_name="bedrock-agent-api",
+            
+            # Enable CORS
             cors_preflight=apigwv2.CorsPreflightOptions(
                 allow_methods=[apigwv2.CorsHttpMethod.POST, apigwv2.CorsHttpMethod.OPTIONS],
                 allow_origins=["*"],          # ← Restrict to your domain in production
                 allow_headers=["Content-Type", "Authorization"],
             ),
         )
-
+        
+        # 7. CONNECT API TO LAMBDA
         lambda_integration = integrations.HttpLambdaIntegration(
             "LambdaIntegration",
             fn,
         )
-
+    
+        # Create /chat endpoint
         http_api.add_routes(
             path="/chat",
             methods=[apigwv2.HttpMethod.POST],
             integration=lambda_integration,
         )
 
-        # Default stage with access logging
+        # 8. CREATE API STAGE
         stage = apigwv2.HttpStage(
             self,
             "ProdStage",
@@ -230,7 +299,7 @@ class BedrockAgentStack(Stack):
             ),
         )
 
-        # ── 5. Outputs ────────────────────────────────────────────────────────
+        # 9. OUTPUT VALUES 
         CfnOutput(self, "OutputApiUrl",
             value=f"{http_api.api_endpoint}/prod/chat",
             description="POST endpoint — send {message} JSON here",

@@ -3,16 +3,27 @@ import os
 import boto3
 import logging
 
+# LOGGING CONFIGURATION
+
+# Create logger object
 logger = logging.getLogger()
+
+# Set logging level
+# INFO means all INFO, WARNING, ERROR logs will be stored
 logger.setLevel(logging.INFO)
 
-# ── Config from CDK-injected environment variables ────────────────────────────
+
+# ENVIRONMENT VARIABLES
+# Values are injected from AWS CDK
 REGION = os.environ.get("AWS_REGION_NAME", "us-east-1")
 MODEL_ID = os.environ.get("MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
 GUARDRAIL_ID = os.environ.get("GUARDRAIL_ID", "")
 GUARDRAIL_VER = os.environ.get("GUARDRAIL_VERSION", "DRAFT")
 
-# Pre-flight deny list: cheap local check before any API call
+# LOCAL DENY LIST
+
+# Blocks dangerous prompt injection attacks
+# before sending requests to Bedrock
 DENY_LIST = [
     "jailbreak",
     "ignore previous instructions",
@@ -22,7 +33,8 @@ DENY_LIST = [
     "hidden instructions",
 ]
 
-# Terms used only for risk scoring. These do not always block the request.
+# HIGH-RISK TERMS
+# Used only for risk classification
 HIGH_RISK_TERMS = [
     "jailbreak",
     "ignore previous instructions",
@@ -34,6 +46,8 @@ HIGH_RISK_TERMS = [
     "remove safety",
 ]
 
+# HALLUCINATION WARNING TERMS
+# Used to detect uncertain responses
 UNCERTAIN_PHRASES = [
     "i think",
     "maybe",
@@ -46,9 +60,10 @@ UNCERTAIN_PHRASES = [
     "may be",
 ]
 
+# CREATE BEDROCK CLIENT
 bedrock_runtime = boto3.client("bedrock-runtime", region_name=REGION)
 
-
+# MAIN LAMBDA FUNCTION
 def lambda_handler(event, context):
     """
     API Gateway HTTP API → Lambda → Bedrock Guardrail → Claude
@@ -56,32 +71,55 @@ def lambda_handler(event, context):
     POST /chat
     Body: { "message": "...", "max_tokens": 1024, "system": "..." }
     """
+
+
+    # Log incoming request
     logger.info("Event: %s", json.dumps(event))
+    # Store event in CloudWatch logs
     _log_risk_event("request_received")
 
-    # ── 1. Parse body ─────────────────────────────────────────────────────────
+    # 1. PARSE REQUEST BODY
     try:
+        # Get request body
         body = event.get("body") or "{}"
+
+        # Convert JSON string to dictionary
         if isinstance(body, str):
             body = json.loads(body)
-
+        
+        # Extract user message
         user_message = body.get("message", "").strip()
+        
+         # Validate message
         if not user_message:
             _log_risk_event("invalid_request", reason="missing_message")
             return _resp(400, {"error": "'message' field is required."})
-
+        
+        # Max tokens for Claude response
         max_tokens = int(body.get("max_tokens", 1024))
+        
+        # System prompt
         system_prompt = body.get("system", "You are a helpful assistant.")
 
     except (json.JSONDecodeError, ValueError) as e:
+
+         # Log JSON parsing errors
         _log_risk_event("invalid_request", reason="bad_json")
         return _resp(400, {"error": f"Invalid request body: {e}"})
 
-    # ── 2. Local deny-list check ──────────────────────────────────────────────
+    # 2. LOCAL DENY LIST CHECK
+
+    # Convert input to lowercase
     lowered = user_message.lower()
+
+     # Check blocked terms
     for term in DENY_LIST:
         if term.lower() in lowered:
+
+             # Calculate risk score
             risk_score = calculate_risk_score(user_message, blocked_by="deny_list")
+           
+            # Log blocked request
             _log_risk_event(
                 "input_blocked",
                 risk_score=risk_score,
@@ -89,6 +127,8 @@ def lambda_handler(event, context):
                 reason="deny_list_match",
                 matched_term=term,
             )
+             
+            # Return blocked response
             return _resp(400, {
                 "error": "GUARDRAIL_BLOCKED",
                 "reason": "Message contains a disallowed term.",
@@ -96,13 +136,19 @@ def lambda_handler(event, context):
                 "risk_score": risk_score,
             })
 
-    # ── 3. Bedrock guardrail: apply to INPUT before model call ────────────────
+    # 3. APPLY INPUT GUARDRAIL
+
+    # Apply Bedrock guardrail to input
     gr = _apply_guardrail(user_message, source="INPUT")
+
+    # Calculate risk score
     input_risk_score = calculate_risk_score(
         user_message,
         pii_found=gr.get("pii_found", []),
         blocked_by=gr.get("blocked_by"),
     )
+
+    # Log input check
     _log_risk_event(
         "input_checked",
         risk_score=input_risk_score,
@@ -110,7 +156,8 @@ def lambda_handler(event, context):
         pii_found=gr.get("pii_found", []),
         guardrail_action=gr.get("action"),
     )
-
+    
+    # If guardrail blocks request
     if gr["action"] == "GUARDRAIL_INTERVENED":
         _log_risk_event(
             "input_blocked",
@@ -126,36 +173,53 @@ def lambda_handler(event, context):
             "pii_found": gr.get("pii_found", []),
             "risk_score": "High",
         })
-
+    
+    # Safe user message
     safe_message = gr.get("output_text", user_message)
 
-    # ── 4. Invoke Claude through Bedrock ──────────────────────────────────────
+    # 4. INVOKE BEDROCK MODEL
+
+    # Claude request payload
     payload = {
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": max_tokens,
         "system": system_prompt,
+
+        # User input
         "messages": [{"role": "user", "content": safe_message}],
     }
 
     try:
+        
+        # Invoke Claude model
         response = bedrock_runtime.invoke_model(
             modelId=MODEL_ID,
             contentType="application/json",
             accept="application/json",
             body=json.dumps(payload),
+
+            # Apply Bedrock guardrail
             guardrailIdentifier=GUARDRAIL_ID,
             guardrailVersion=GUARDRAIL_VER,
+
+            # Enable tracing
             trace="ENABLED",
         )
+
+        # Read model response
         resp_body = json.loads(response["body"].read())
         logger.info("Bedrock response: %s", json.dumps(resp_body))
 
     except Exception as e:
+
+        # Log Bedrock errors
         logger.error("Bedrock error: %s", e)
         _log_risk_event("bedrock_invocation_failed", risk_score="Medium", reason=str(e))
         return _resp(500, {"error": "Bedrock invocation failed.", "detail": str(e)})
 
-    # ── 5. Check if Bedrock blocked the model output during invocation ────────
+    # 5. CHECK OUTPUT BLOCKING
+
+    # If Bedrock blocks unsafe output
     if resp_body.get("stop_reason") == "guardrail_intervened":
         _log_risk_event(
             "output_blocked",
@@ -170,24 +234,34 @@ def lambda_handler(event, context):
             "risk_score": "High",
         })
 
-    # ── 6. Extract reply and token usage ──────────────────────────────────────
+     # 6. EXTRACT MODEL RESPONSE
     try:
+
+        # Claude generated reply
         reply = resp_body["content"][0]["text"]
+
+         # Token usage
         input_tokens = resp_body["usage"]["input_tokens"]
         output_tokens = resp_body["usage"]["output_tokens"]
+    
     except (KeyError, IndexError):
         _log_risk_event("unexpected_bedrock_response", risk_score="Medium")
         return _resp(502, {"error": "Unexpected Bedrock response shape.", "raw": resp_body})
 
-    # ── 7. Output guardrail: check model response before sending ──────────────
+    # 7. APPLY OUTPUT GUARDRAIL
+
+    # Apply output moderation
     output_gr = _apply_guardrail(reply, source="OUTPUT")
+
+    # Log output check
     _log_risk_event(
         "output_checked",
         risk_score=input_risk_score,
         blocked_by=output_gr.get("blocked_by"),
         guardrail_action=output_gr.get("action"),
     )
-
+    
+    # If output is unsafe
     if output_gr["action"] == "GUARDRAIL_INTERVENED":
         _log_risk_event(
             "output_blocked",
@@ -201,11 +275,16 @@ def lambda_handler(event, context):
             "blocked_by": output_gr.get("blocked_by"),
             "risk_score": "High",
         })
-
+    
+    # Safe response
     safe_reply = output_gr.get("output_text", reply)
 
-    # ── 8. Hallucination warning ──────────────────────────────────────────────
+    # 8. HALLUCINATION WARNING CHECK
+
+    # Detect uncertain responses
     hallucination_flag = has_hallucination_warning(safe_reply)
+    
+    # Log warning
     if hallucination_flag:
         _log_risk_event(
             "hallucination_warning_triggered",
@@ -213,13 +292,14 @@ def lambda_handler(event, context):
             reason="uncertain_or_unsupported_language_detected",
         )
 
-    # ── 9. Return final safe response ─────────────────────────────────────────
+    # 9. RETURN FINAL RESPONSE
     _log_risk_event(
         "response_returned",
         risk_score=input_risk_score,
         hallucination_warning=hallucination_flag,
     )
-
+    
+    # Return safe API response
     return _resp(200, {
         "reply": safe_reply,
         "model": MODEL_ID,
@@ -237,8 +317,7 @@ def lambda_handler(event, context):
         },
     })
 
-
-# ── Risk score helper ─────────────────────────────────────────────────────────
+# RISK SCORE FUNCTION
 def calculate_risk_score(user_message: str, pii_found=None, blocked_by=None) -> str:
     """
     Classifies requests as Low, Medium, or High risk.
@@ -248,35 +327,37 @@ def calculate_risk_score(user_message: str, pii_found=None, blocked_by=None) -> 
     """
     pii_found = pii_found or []
     lowered = user_message.lower()
-
+    
+    # High-risk blocked terms
     if blocked_by in ["deny_list", "word_policy", "content_policy", "prompt_attack", "topic_policy"]:
         return "High"
 
+    # High-risk keywords
     if any(term in lowered for term in HIGH_RISK_TERMS):
         return "High"
-
+    
+    # Medium-risk PII
     if pii_found:
         return "Medium"
-
+    
     if blocked_by in ["pii_policy", "bedrock_guardrail"]:
         return "Medium"
 
     return "Low"
 
+# HALLUCINATION WARNING FUNCTION
 
-# ── Hallucination warning helper ──────────────────────────────────────────────
 def has_hallucination_warning(reply: str) -> bool:
     """
-    Simple warning method for uncertain or unsupported language.
-    This does not prove hallucination; it only flags answers that may need review.
+    Detect uncertain AI responses
     """
     lowered = reply.lower()
     return any(phrase in lowered for phrase in UNCERTAIN_PHRASES)
 
 
-# ── Risk-event logging helper ─────────────────────────────────────────────────
+# CLOUDWATCH LOGGING FUNCTION
 def _log_risk_event(event_type: str, **kwargs) -> None:
-    """Logs all important guardrail and risk events to CloudWatch."""
+    """Logs all important guardrail and Store risk events in CloudWatch logs"""
     log_record = {
         "event_type": event_type,
         **kwargs,
@@ -284,15 +365,19 @@ def _log_risk_event(event_type: str, **kwargs) -> None:
     logger.info("RISK_EVENT: %s", json.dumps(log_record))
 
 
-# ── Guardrail helper ──────────────────────────────────────────────────────────
+# APPLY BEDROCK GUARDRAIL
+
 def _apply_guardrail(text: str, source: str = "INPUT") -> dict:
     try:
+        
+        # Call Bedrock ApplyGuardrail API
         resp = bedrock_runtime.apply_guardrail(
             guardrailIdentifier=GUARDRAIL_ID,
             guardrailVersion=GUARDRAIL_VER,
             source=source,
             content=[{"text": {"text": text}}],
         )
+
         action = resp.get("action", "NONE")
         outputs = resp.get("outputs", [])
         assessments = resp.get("assessments", [{}])
@@ -302,16 +387,20 @@ def _apply_guardrail(text: str, source: str = "INPUT") -> dict:
         blocked_by = "bedrock_guardrail"
         reason = "Content policy violation."
         pii_found = []
-
+        
+        # Topic policy detection
         if assessment.get("topicPolicy", {}).get("topics"):
             blocked_by, reason = "topic_policy", "Message is off-topic."
-
+        
+        # Content policy detection
         if assessment.get("contentPolicy", {}).get("filters"):
             blocked_by, reason = "content_policy", "Harmful or toxic content detected."
-
+        
+        # Word policy detection
         if assessment.get("wordPolicy", {}).get("customWords"):
             blocked_by, reason = "word_policy", "Message contains a disallowed word."
-
+        
+        # Sensitive info detection
         if assessment.get("sensitiveInformationPolicy", {}).get("piiEntities"):
             pii_found = [
                 entity.get("type")
@@ -329,8 +418,8 @@ def _apply_guardrail(text: str, source: str = "INPUT") -> dict:
         }
 
     except Exception as e:
+        
         # Fail-open for development so the app still runs if ApplyGuardrail fails.
-        # For production, you can change this to fail-closed.
         logger.error("ApplyGuardrail failed (fail-open): %s", e)
         _log_risk_event("apply_guardrail_failed", risk_score="Medium", source=source, reason=str(e))
         return {
@@ -342,7 +431,7 @@ def _apply_guardrail(text: str, source: str = "INPUT") -> dict:
         }
 
 
-# ── Response helper ───────────────────────────────────────────────────────────
+# API RESPONSE FUNCTION
 def _resp(status: int, body: dict) -> dict:
     return {
         "statusCode": status,
