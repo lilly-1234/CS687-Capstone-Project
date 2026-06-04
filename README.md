@@ -383,7 +383,6 @@ aws logs tail /aws/lambda/<lambda-name> --follow
 # Future Scope
 
 - Add frontend dashboard
-- Multi-model support
 - Real-time monitoring dashboard
 - Advanced threat analytics
 
