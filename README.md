@@ -380,14 +380,4 @@ View logs:
 aws logs tail /aws/lambda/<lambda-name> --follow
 ```
 
-# Future Scope
 
-- Add frontend dashboard
-- Real-time monitoring dashboard
-- Advanced threat analytics
-
-# Author
-
-Likhitha Lakshmi Gudivada  
-Master of Science in Computer Science  
-City University of Seattle
